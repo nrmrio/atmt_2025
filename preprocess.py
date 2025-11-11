@@ -66,8 +66,11 @@ def make_binary_dataset(input_file, output_file, preprocessor: BPETokenizer, app
     with open(output_file, 'wb') as outf:
         pickle.dump(tokens_list, outf, protocol=pickle.DEFAULT_PROTOCOL)
         if not args.quiet:
-            logging.info('Built a binary dataset for {}: {} sentences, {} tokens, {:.3f}% replaced by unknown token'.format(
-            input_file, nsent, ntok, 100.0 * unk_counter / ntok, preprocessor.tokenizer.unk_id()))
+            logging.info(
+    'Built a binary dataset for {}: {} sentences, {} tokens, {:.3f}% replaced by <unk>'.format(
+        input_file, nsent, ntok, 0.0 if ntok == 0 else (100.0 * unk_counter / ntok)
+    )
+)
 
 
 if __name__ == "__main__":

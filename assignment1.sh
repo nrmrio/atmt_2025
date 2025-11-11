@@ -26,7 +26,9 @@ python preprocess.py \
     --src-vocab-size 8000 \
     --tgt-vocab-size 8000 \
     --src-model ./cz-en/tokenizers/cz-bpe-8000.model \
-    --tgt-model ./cz-en/tokenizers/en-bpe-8000.model
+    --tgt-model ./cz-en/tokenizers/en-bpe-8000.model \
+    --ignore-existing \
+    --force-train
 
 # TRAIN
 python train.py \

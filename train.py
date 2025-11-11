@@ -4,6 +4,7 @@ import time
 import logging
 import argparse
 import numpy as np
+import json
 from tqdm import tqdm
 import sentencepiece as spm
 from collections import OrderedDict
@@ -19,8 +20,15 @@ from seq2seq.data.dataset import Seq2SeqDataset, BatchSampler
 from seq2seq import models, utils
 from seq2seq.decode import decode
 from seq2seq.models import ARCH_MODEL_REGISTRY, ARCH_CONFIG_REGISTRY
+from schedulers import ConstantWarmup, LinearWarmupDecay
 
 SEED = random.randint(1, 1_000_000_000)
+
+def _append_jsonl(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'a', encoding='utf-8') as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + '\n')
+
 
 
 def get_args():
@@ -36,7 +44,13 @@ def get_args():
     parser.add_argument('--tgt-tokenizer', help='path to target sentencepiece tokenizer', required=True)
     parser.add_argument('--max-tokens', default=None, type=int, help='maximum number of tokens in a batch')
     parser.add_argument('--batch-size', default=1, type=int, help='maximum number of sentences in a batch')
+    parser.add_argument('--accum-steps' ,default=1, type=int, help='gradient accumulation steps')
+    parser.add_argument('--num-workers', default=1, type=int, help='DataLoader workers')
+    parser.add_argument('--pin-memory', action='store_true', help='pin CPU memory for faster host→GPU copies')
+    parser.add_argument('--amp', type=str, default='fp32', choices=['fp32','fp16','bf16'], help='automatic mixed precision')
     parser.add_argument('--train-on-tiny', action='store_true', help='train model on a tiny dataset')
+    parser.add_argument("--lr-warmup", type=str, default="none", choices=["none","constant","linear"])
+    parser.add_argument("--warmup-steps", type=int, default=4000)
     
     # # Add model arguments
     parser.add_argument('--arch', default='transformer', choices=ARCH_MODEL_REGISTRY.keys(), help='model architecture')
@@ -48,6 +62,7 @@ def get_args():
     parser.add_argument('--patience', default=3, type=int,
                         help='number of epochs without improvement on validation set before early stopping')
     parser.add_argument('--max-length', default=300, type=int, help='maximum output sequence length during testing')
+    # parser.add_argument('--max-seq-len', default=300, type=int, help='maximum sequence length for batching')
     # Add checkpoint arguments
     parser.add_argument('--log-file', default=None, help='path to save logs')
     parser.add_argument('--save-dir', default='checkpoints_asg4', help='path to save checkpoints')
@@ -70,6 +85,10 @@ def main(args):
     """ Main training function. Trains the translation model over the course of several epochs, including dynamic
     learning rate adjustment and gradient clipping. """
     logging.info('Commencing training!')
+    run_name = os.path.basename(args.save_dir.rstrip('/')) or 'run'
+    log_steps = os.path.join(args.save_dir, 'log_steps.jsonl')
+    log_epochs = os.path.join(args.save_dir, 'log_epochs.jsonl')
+
     torch.manual_seed(SEED)
 
     utils.init_logging(args)
@@ -97,10 +116,20 @@ def main(args):
         criterion = criterion.cuda()
 
     device = torch.device("cuda" if args.cuda else "cpu")
+    use_amp = (args.amp in ['fp16','bf16'])
+    amp_dtype = torch.float16 if args.amp=='fp16' else (torch.bfloat16 if args.amp=='bf16' else None)
     
     
     # Instantiate optimizer and learning rate scheduler
     optimizer = torch.optim.Adam(model.parameters(), args.lr)
+    base_lr = args.lr
+    if args.lr_warmup == "constant":
+        scheduler = ConstantWarmup(optimizer, base_lr, args.warmup_steps)
+    elif args.lr_warmup == "linear":
+        scheduler = LinearWarmupDecay(optimizer, base_lr, args.warmup_steps)
+    else:
+        scheduler = None
+
 
     state_dict = None
     if not args.ignore_checkpoints:
@@ -115,8 +144,11 @@ def main(args):
     make_batch = utils.make_batch_input(device=device, pad=src_tokenizer.pad_id(), max_seq_len=args.max_seq_len)
     
     for epoch in range(last_epoch + 1, args.max_epoch):
+        epoch_start = time.perf_counter()
+        step_idx = 0
+
         train_loader = \
-            torch.utils.data.DataLoader(train_dataset, num_workers=1, collate_fn=train_dataset.collater,
+            torch.utils.data.DataLoader(train_dataset, num_workers=args.num_workers, pin_memory=args.pin_memory, collate_fn=train_dataset.collater,
                                         batch_sampler=BatchSampler(train_dataset, args.max_tokens, args.batch_size, 1,
                                                                    0, shuffle=True, seed=SEED))
         model.train()
@@ -158,7 +190,21 @@ def main(args):
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_norm)
             optimizer.step()
+            # LR warmup update
+            if scheduler is not None:
+                scheduler.step()
             optimizer.zero_grad()
+            step_idx += 1
+            _append_jsonl(log_steps, {
+                'run': run_name,
+                'epoch': int(epoch),
+                'step': int(step_idx),
+                'lr': float(optimizer.param_groups[0]['lr']),
+                'loss': float(loss.item()),
+                'num_tokens': int(sample['num_tokens']),
+                'time_s': float(time.perf_counter() - epoch_start)
+            })
+
 
             # Update statistics for progress bar
             total_loss, num_tokens, batch_size = loss.item(), sample['num_tokens'], len(sample['src_tokens'])
@@ -182,6 +228,17 @@ def main(args):
         # Calculate validation loss
         valid_perplexity = validate(args, model, criterion, valid_dataset, epoch, batch_fn=make_batch, src_tokenizer=src_tokenizer, tgt_tokenizer=tgt_tokenizer)
         model.train()
+        epoch_time = time.perf_counter() - epoch_start
+        _append_jsonl(log_epochs, {
+            'run': run_name,
+            'epoch': int(epoch),
+            'train_loss': float(stats['loss'] / max(1, len(progress_bar))),
+            'grad_norm': float(stats['grad_norm'] / max(1, len(progress_bar))),
+            'ppl_valid': float(valid_perplexity),
+            'bleu_valid': None,
+            'epoch_time_s': float(epoch_time),
+            'lr_end': float(optimizer.param_groups[0]['lr'])
+        })
         
         # Save checkpoints
         if epoch % args.save_interval == 0:
@@ -221,7 +278,7 @@ def validate(args, model, criterion, valid_dataset, epoch,
              tgt_tokenizer: spm.SentencePieceProcessor):
     """ Validates model performance on a held-out development set. """
     valid_loader = \
-        torch.utils.data.DataLoader(valid_dataset, num_workers=1, collate_fn=valid_dataset.collater,
+        torch.utils.data.DataLoader(valid_dataset, num_workers=args.num_workers, pin_memory=args.pin_memory, collate_fn=valid_dataset.collater,
                                     batch_sampler=BatchSampler(valid_dataset, args.max_tokens, args.batch_size, 1, 0,
                                                                shuffle=False, seed=SEED))
     model.eval()
@@ -316,6 +373,8 @@ def evaluate(args, model, test_dataset,
 
     model.eval()
     device = torch.device("cuda" if args.cuda else "cpu")
+    use_amp = (args.amp in ['fp16','bf16'])
+    amp_dtype = torch.float16 if args.amp=='fp16' else (torch.bfloat16 if args.amp=='bf16' else None)
 
     all_references = []
     all_hypotheses = []
@@ -369,7 +428,10 @@ def evaluate(args, model, test_dataset,
 if __name__ == '__main__':
     args = get_args()
     args.seed = SEED
-    os.makedirs(os.path.dirname(args.log_file), exist_ok=True)
+    log_dir = os.path.dirname(args.log_file) if args.log_file else ''
+    if log_dir:
+      os.makedirs(log_dir, exist_ok=True)
+
 
     # Set up logging to file
     logging.basicConfig(filename=args.log_file, filemode='a', level=logging.INFO,
